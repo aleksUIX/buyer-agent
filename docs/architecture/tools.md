@@ -218,6 +218,10 @@ A nonblank `query` calls the seller's `search_products`; otherwise the tool call
 
 Blank strings and an empty `targeting` list are not filters. `max_cpm=0` is a cap, so it matches no priced product. The `{"products": [...]}` envelope that seller-agent's MCP `list_products` returns is read as a product list.
 
+`mobile` and `mobile_app` are accepted as the same channel. Field lookup skips null values before checking the next alias. The client exposes `UnifiedResult.filter_summary`: `applied`, `excluded_count`, `unchecked_count` and `note`. `unchecked_count` counts products excluded because at least one requested field is missing or unusable; it is a subset of `excluded_count`. The tool reports both counts.
+
+A text answer or an unsupported response envelope is returned unchanged by the client, with `applied=False` and an explanatory note. The tool reports that filtering could not be applied instead of displaying an empty catalog. A query still requires the seller to implement `search_products`; buyer-side filtering does not add that capability. Filter-only requests use `list_products`.
+
 ```python
 from ad_buyer.tools.buyer_deals import DiscoverInventoryTool
 from ad_buyer.clients.unified_client import UnifiedClient

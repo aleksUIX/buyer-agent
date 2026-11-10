@@ -24,6 +24,16 @@ class Protocol(Enum):
 
 
 @dataclass
+class ProductFilterSummary:
+    """Outcome of local filtering; unchecked products remain excluded."""
+
+    applied: bool = True
+    excluded_count: int = 0
+    unchecked_count: int = 0
+    note: str = ""
+
+
+@dataclass
 class UnifiedResult:
     """Unified result from either MCP or A2A client."""
 
@@ -32,6 +42,7 @@ class UnifiedResult:
     error: str = ""
     protocol: Protocol = Protocol.MCP
     raw: Any = None
+    filter_summary: ProductFilterSummary | None = None
 
     @classmethod
     def from_mcp(cls, result: MCPToolResult) -> "UnifiedResult":
@@ -101,25 +112,35 @@ def build_product_filters(
     return filters
 
 
-def apply_product_filters(data: Any, filters: dict[str, Any]) -> tuple[list[Any], int]:
+def apply_product_filters(data: Any, filters: dict[str, Any]) -> tuple[Any, ProductFilterSummary]:
     """Keep the products that satisfy every filter.
 
     ``data`` is a product list, a single product dict, or seller-agent's
     ``{"products": [...]}`` envelope. A product passes a filter only if it lists
-    a value that satisfies it, so products missing the field and entries that
-    are not dicts are excluded.
+    a value that satisfies it. Products with missing or unusable filtered fields
+    remain excluded and are counted as unchecked. Unsupported response shapes
+    are preserved with applied=False instead of becoming an empty catalog.
 
     Returns:
-        The matching products and the number excluded.
+        The matching products (or unchanged data) and filter diagnostics.
     """
     if isinstance(data, dict) and isinstance(data.get("products"), list):
         products = data["products"]
-    elif isinstance(data, list):
+    elif isinstance(data, list) and all(isinstance(p, dict) for p in data):
         products = data
-    elif data:
+    elif isinstance(data, dict) and any(key in data for key in _PRODUCT_KEYS):
         products = [data]
     else:
-        products = []
+        products = None
+
+    if products is None or not all(isinstance(p, dict) for p in products):
+        return data, ProductFilterSummary(
+            applied=False,
+            note=(
+                "Product filters could not be applied: "
+                "the seller returned an unsupported inventory response."
+            ),
+        )
 
     checks = [(_PRODUCT_FILTER_CHECKS[key], value) for key, value in filters.items()]
     kept = [
@@ -127,12 +148,17 @@ def apply_product_filters(data: Any, filters: dict[str, Any]) -> tuple[list[Any]
         for product in products
         if isinstance(product, dict) and all(check(product, value) for check, value in checks)
     ]
-    return kept, len(products) - len(kept)
+    unchecked = sum(
+        any(not _filter_field_available(product, key) for key in filters) for product in products
+    )
+    return kept, ProductFilterSummary(
+        excluded_count=len(products) - len(kept), unchecked_count=unchecked
+    )
 
 
 def _product_value(product: dict, keys: tuple[str, ...]) -> Any:
     for key in keys:
-        if key in product:
+        if key in product and product[key] is not None:
             return product[key]
     return None
 
@@ -146,7 +172,13 @@ def _same_text(value: Any, wanted: Any) -> bool:
 
 
 def _matches_channel(product: dict, channel: str) -> bool:
-    return _same_text(_product_value(product, _CHANNEL_KEYS), channel)
+    value = _product_value(product, _CHANNEL_KEYS)
+    if not isinstance(value, str):
+        return False
+    aliases = {"mobile": "mobile_app"}
+    actual = value.strip().lower()
+    wanted = channel.strip().lower()
+    return _same_text(aliases.get(actual, actual), aliases.get(wanted, wanted))
 
 
 def _within_max_cpm(product: dict, max_cpm: float) -> bool:
@@ -183,6 +215,28 @@ _PRODUCT_FILTER_CHECKS = {
     "targeting": _offers_targeting,
     "publisher": _matches_publisher,
 }
+
+_PRODUCT_FILTER_KEYS = {
+    "channel": _CHANNEL_KEYS,
+    "maxPrice": _PRICE_KEYS,
+    "minImpressions": _IMPRESSIONS_KEYS,
+    "targeting": _TARGETING_KEYS,
+    "publisher": _PUBLISHER_KEYS,
+}
+_PRODUCT_KEYS = {"id", "product_id", "name"}.union(*_PRODUCT_FILTER_KEYS.values())
+
+
+def _filter_field_available(product: dict, key: str) -> bool:
+    value = _product_value(product, _PRODUCT_FILTER_KEYS[key])
+    if key == "maxPrice":
+        return _is_number(value) and value > 0
+    if key == "minImpressions":
+        return _is_number(value)
+    if key == "targeting":
+        if isinstance(value, dict):
+            value = value.get("capabilities")
+        return isinstance(value, list)
+    return isinstance(value, str) and bool(value.strip())
 
 
 class UnifiedClient:
@@ -602,11 +656,14 @@ class UnifiedClient:
         filters are forwarded to search_products and also applied here to the
         returned products, because sellers may ignore them. A product passes
         only if it lists a matching value; products missing a filtered field
-        are excluded.
+        are excluded. ``filter_summary`` reports excluded and unchecked counts.
+        Unsupported response shapes are returned unchanged with applied=False
+        and an explanatory note. A query still requires seller search_products
+        support; local filtering does not add that tool to a seller.
 
         Args:
             query: Natural language query (e.g., 'CTV inventory under $25 CPM')
-            channel: Channel filter ('ctv', 'display', 'video', 'mobile')
+            channel: Channel filter ('ctv', 'display', 'video', 'mobile'/'mobile_app')
             max_cpm: Maximum listed CPM; unpriced products are excluded. 0 is a cap.
             min_impressions: Minimum available impressions; 0 means no minimum
             targeting: Required targeting capabilities; the product must list all
@@ -634,8 +691,8 @@ class UnifiedClient:
 
         if not product_filters or not result.success:
             return result
-        products, _ = apply_product_filters(result.data, product_filters)
-        return replace(result, data=products)
+        products, summary = apply_product_filters(result.data, product_filters)
+        return replace(result, data=products, filter_summary=summary)
 
     async def get_pricing(
         self,

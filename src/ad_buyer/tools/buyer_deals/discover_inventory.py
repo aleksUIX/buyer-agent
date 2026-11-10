@@ -33,7 +33,7 @@ class DiscoverInventoryInput(BaseModel):
     )
     channel: str | None = Field(
         default=None,
-        description="Channel filter (e.g., 'ctv', 'display', 'video', 'mobile')",
+        description="Channel filter (e.g., 'ctv', 'display', 'video', 'mobile'/'mobile_app')",
     )
     max_cpm: float | None = Field(
         default=None,
@@ -73,6 +73,9 @@ class DiscoverInventoryTool(BaseTool):
 Presents buyer identity to unlock tiered pricing and premium access.
 Filters work with or without a query. They are applied to the products the seller
 returns, and a product that does not list a filtered field is excluded.
+The result reports how many products were excluded and could not be checked.
+Unsupported responses are reported as unfilterable. A query requires the seller
+to implement search_products; use a filter-only listing otherwise.
 
 Args:
     query: Natural language query (e.g., 'CTV inventory under $25 CPM')
@@ -182,18 +185,21 @@ Returns:
             if not result.success:
                 return f"Error discovering inventory: {result.error}"
 
-            products, excluded = result.data, 0
+            products, summary = result.data, None
             if product_filters:
                 # Sellers may ignore the filters, so apply them to what came back.
-                products, excluded = apply_product_filters(result.data, product_filters)
+                products, summary = apply_product_filters(result.data, product_filters)
+                if not summary.applied:
+                    return summary.note
 
             approvals = await self._fetch_approvals(products)
             filtered, filter_summary = self._apply_enforcement(products, approvals)
             output = self._format_results(filtered, identity_context, approvals, filter_summary)
-            if excluded:
+            if summary and summary.excluded_count:
                 output += (
-                    f"\nProduct filters excluded {excluded} product(s), "
-                    "including any that do not list a filtered field."
+                    f"\nProduct filters excluded {summary.excluded_count} product(s); "
+                    f"{summary.unchecked_count} could not be checked because a filtered "
+                    "field was missing or unusable."
                 )
             return output
 
